@@ -1,6 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 import pandas as pd
 import requests
 import math
@@ -9,7 +8,6 @@ import json
 import time
 import os
 from datetime import datetime, timezone
-from typing import Optional
 
 app = FastAPI(title="Ottrd API")
 
@@ -23,8 +21,6 @@ app.add_middleware(
 KEEPA_API_KEY = os.environ.get("KEEPA_API_KEY", "")
 KEEPA_BASE    = "https://api.keepa.com/product"
 KEEPA_EPOCH   = datetime(2011, 1, 1, tzinfo=timezone.utc)
-
-# ── Keepa helpers ─────────────────────────────────────────────────────────────
 
 def keepa_time_to_dt(kt):
     try:
@@ -45,7 +41,6 @@ def get_all_prices(prod):
             v = arr[18]
             return kp(v) if (v and v > 0) else None
         return None
-
     current = None
     bb = stats.get("buyBoxPrice")
     if isinstance(bb, list):
@@ -62,7 +57,6 @@ def get_all_prices(prod):
                         current = kp(val)
                         break
             if current: break
-
     return {
         "current": validate_price(current),
         "avg30":   validate_price(bb_from_avg(stats.get("avg30"))),
@@ -126,16 +120,6 @@ def auto_col(df, candidates):
             if cand in key: return real
     return None
 
-def last_12_months():
-    now = datetime.now()
-    months = []
-    for i in range(11, -1, -1):
-        m = now.month - i
-        y = now.year
-        while m <= 0: m += 12; y -= 1
-        months.append(f"{y}-{m:02d}")
-    return months
-
 def fetch_keepa_batch(upcs, retries=3):
     params = {
         "key": KEEPA_API_KEY, "domain": 1,
@@ -170,26 +154,27 @@ def fetch_keepa_batch(upcs, retries=3):
             raise e
     raise Exception(f"Keepa timed out: {last_err}")
 
-def process_item(item, prod, settings):
-    overhead    = settings["overhead"] / 100.0
-    min_roi     = settings["min_roi"]
-    min_profit  = settings["min_profit"]
-    price_basis = settings["price_basis"]
-    pb_map      = settings["pb_map"]
-    active_months = settings["active_months"]
-    order_basis = settings["order_basis"]
-    order_pct   = settings["order_pct"] / 100.0
+def process_item(item, prod, s):
+    overhead     = s["overhead"] / 100.0
+    min_roi      = s["min_roi"]
+    min_profit   = s["min_profit"]
+    price_basis  = s["price_basis"]
+    pb_map       = s["pb_map"]
+    active_months = set(s["active_months"])
+    order_basis  = s["order_basis"]
+    order_pct    = s["order_pct"] / 100.0
+    threshold    = s["threshold"]
 
-    monthly     = parse_monthly_sales(prod)
-    ever_hit    = any(v >= settings["threshold"] for v in monthly.values())
-    filtered    = {k: v for k, v in monthly.items() if int(k.split("-")[1]) in active_months}
-    peak        = max(filtered.values()) if filtered else 0
-    peak_all    = max(monthly.values()) if monthly else 0
+    monthly    = parse_monthly_sales(prod)
+    ever_hit   = any(v >= threshold for v in monthly.values())
+    filtered   = {k: v for k, v in monthly.items() if int(k.split("-")[1]) in active_months}
+    peak       = max(filtered.values()) if filtered else 0
+    peak_all   = max(monthly.values()) if monthly else 0
     avg_filtered = round(sum(filtered.values()) / len(filtered), 1) if filtered else 0
 
-    all_prices  = get_all_prices(prod)
-    asin        = prod.get("asin", "")
-    title       = (prod.get("title") or item["name"] or item["upc"])[:70]
+    all_prices = get_all_prices(prod)
+    asin       = prod.get("asin", "")
+    title      = (prod.get("title") or item["name"] or item["upc"])[:70]
 
     referral_pct = float(prod.get("referralFeePercent") or prod.get("referralFeePercentage") or 15.0)
     pick_and_pack = None
@@ -205,11 +190,11 @@ def process_item(item, prod, settings):
         amz_price = all_prices.get(price_basis)
 
     ref_fee, pp_fee, fee = calc_fees(amz_price, referral_pct, pick_and_pack)
-    fee_source  = "Keepa" if pick_and_pack is not None else "Est."
-    true_cost   = round(item["cost"] * (1 + overhead), 2)
-    net_sale    = round(amz_price - fee, 2) if (amz_price and fee) else None
-    net         = round(net_sale - true_cost, 2) if net_sale is not None else None
-    roi         = round((net / true_cost) * 100, 1) if (net is not None and true_cost > 0) else None
+    fee_source = "Keepa" if pick_and_pack is not None else "Est."
+    true_cost  = round(item["cost"] * (1 + overhead), 2)
+    net_sale   = round(amz_price - fee, 2) if (amz_price and fee) else None
+    net        = round(net_sale - true_cost, 2) if net_sale is not None else None
+    roi        = round((net / true_cost) * 100, 1) if (net is not None and true_cost > 0) else None
 
     if net_sale is not None:
         target_true_cost = round(net_sale / (1 + min_roi / 100), 2)
@@ -231,20 +216,17 @@ def process_item(item, prod, settings):
 
     if order_basis == "avg" and avg_filtered > 0:
         suggested_qty = max(math.ceil(avg_filtered * order_pct), 1)
-        qty_basis_str = f"avg({avg_filtered:.0f})×{int(order_pct*100)}%"
+        qty_basis_str = f"avg({avg_filtered:.0f})x{int(order_pct*100)}%"
     elif peak > 0:
         suggested_qty = max(math.ceil(peak * 1.5), 6)
         qty_basis_str = f"peak({peak})"
     else:
         suggested_qty = 0
-        qty_basis_str = "—"
+        qty_basis_str = "-"
 
     pct_off = None
     if target_supplier is not None and item["cost"] > 0:
-        if price_gap is not None and price_gap <= 0:
-            pct_off = 0.0
-        else:
-            pct_off = round(((item["cost"] - target_supplier) / item["cost"]) * 100, 1)
+        pct_off = 0.0 if (price_gap is not None and price_gap <= 0) else round(((item["cost"] - target_supplier) / item["cost"]) * 100, 1)
 
     return {
         "sku": item["sku"], "upc": item["upc"], "asin": asin, "title": title,
@@ -268,7 +250,9 @@ def process_item(item, prod, settings):
         "found": True, "error": ""
     }
 
-# ── API Routes ────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"service": "Ottrd API", "status": "ok"}
 
 @app.get("/health")
 def health():
@@ -283,10 +267,9 @@ async def analyze(
         raise HTTPException(500, "Keepa API key not configured")
 
     s = json.loads(settings)
-
-    # Parse file
     content = await file.read()
     ext = file.filename.split(".")[-1].lower()
+
     try:
         if ext == "csv":
             df = pd.read_csv(io.BytesIO(content), dtype=str)
@@ -302,13 +285,12 @@ async def analyze(
     name_col = auto_col(df, ["name","title","product","description","item"])
     sku_col  = auto_col(df, ["sku","item #","part","model","item no"])
 
-    if not upc_col:  raise HTTPException(400, "No UPC column found in file")
-    if not cost_col: raise HTTPException(400, "No cost column found in file")
+    if not upc_col:  raise HTTPException(400, "No UPC column found")
+    if not cost_col: raise HTTPException(400, "No cost column found")
 
     items = []
     for _, row in df.iterrows():
-        raw_upc  = str(row[upc_col]).strip()
-        variants = clean_upc(raw_upc)
+        variants = clean_upc(str(row[upc_col]).strip())
         cost     = clean_cost(row[cost_col])
         if not variants or cost <= 0: continue
         items.append({
@@ -320,7 +302,6 @@ async def analyze(
     if not items:
         raise HTTPException(400, "No valid UPC + cost rows found")
 
-    # Process in batches
     BATCH = 50
     results = []
     for i in range(0, len(items), BATCH):
@@ -351,7 +332,7 @@ async def analyze(
                 results.append(process_item(item, prod, s))
 
         if i + BATCH < len(items):
-            time.sleep(1)
+            time.sleep(0.5)
 
     return {"results": results, "total": len(results)}
 
